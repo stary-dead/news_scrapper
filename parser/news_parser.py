@@ -1,11 +1,14 @@
-from categories import CategoryStructure
-import requests
+from .categories import CategoryStructure
+import httpx
+import asyncio
 from bs4 import BeautifulSoup
 from datetime import datetime
 from urllib.parse import urljoin
 import time
-from models import NewsArticle
+from .models import NewsArticle
 import logging
+import json
+import os
 
 
 class NewsParser:
@@ -27,40 +30,93 @@ class NewsParser:
             console_handler.setFormatter(formatter)
             self.logger.addHandler(console_handler)
 
-    def _get_page_content(self, url: str) -> str:
-        """Get page content"""
-        try:
-            time.sleep(1)  # Delay between requests
-            response = requests.get(url, headers=self.headers, allow_redirects=True)
-            response.raise_for_status()
-            return response.text
-        except requests.RequestException as e:
-            self.logger.error(f"Error getting page {url}: {e}")
-            return None
+    async def _get_page_content(self, url: str) -> str:
+        """Get page content asynchronously"""
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                async with httpx.AsyncClient(headers=self.headers, follow_redirects=True, timeout=10.0) as client:
+                    await asyncio.sleep(1)  # Delay between requests
+                    response = await client.get(url)
+                    
+                    # Handle common HTTP errors
+                    if response.status_code == 404:
+                        self.logger.error(f"Page not found: {url}")
+                        return None
+                    elif response.status_code == 403:
+                        self.logger.error(f"Access forbidden: {url}")
+                        return None
+                    elif response.status_code != 200:
+                        self.logger.error(f"HTTP error {response.status_code} for {url}")
+                        retry_count += 1
+                        await asyncio.sleep(2 ** retry_count)  # Exponential backoff
+                        continue
+                    
+                    return response.text
+            except httpx.TimeoutException:
+                self.logger.error(f"Timeout while fetching {url}")
+                retry_count += 1
+                await asyncio.sleep(2 ** retry_count)
+            except httpx.RequestError as e:
+                self.logger.error(f"Error getting page {url}: {e}")
+                retry_count += 1
+                await asyncio.sleep(2 ** retry_count)
+            except Exception as e:
+                self.logger.error(f"Unexpected error while fetching {url}: {e}")
+                return None
+        
+        self.logger.error(f"Failed to fetch {url} after {max_retries} retries")
+        return None
 
     def _parse_datetime(self, date_str: str) -> datetime:
         """Parse date from string"""
         try:
             return datetime.strptime(date_str, "%d.%m.%Y %H:%M")
         except (ValueError, TypeError):
-            return None
-
+            return None    
     def _is_valid_article_url(self, url: str) -> bool:
         """Check if URL is a valid article link"""
         if not url:
             return False
+            
+        # Convert URL to lowercase for case-insensitive comparison
+        url_lower = url.lower()
+        
+        # Accept both relative and absolute URLs from rp.pl
+        if not (url_lower.startswith('/') or url_lower.startswith('https://www.rp.pl')):
+            self.logger.debug(f"Skipping external URL: {url}")
+            return False
+            
+        # Skip certain file types and special paths
+        if any(ext in url_lower for ext in ['.jpg', '.pdf', '.png', '.xml', 'rss', 'feed']):
+            self.logger.debug(f"Skipping file/feed URL: {url}")
+            return False
 
-        # Check if URL leads to an article
-        article_indicators = [
-            '/art',  # Standard article indicator
-            '/ekonomia/',  # Economy section
-            '/biznes/',    # Business section
-            '/eksport/'    # Export section
+        # Skip special sections and system pages
+        special_sections = [
+            '/logowanie',
+            '/moj-profil',
+            '/mapa-strony',
+            '/regulamin',
+            '/rodo'
         ]
         
-        return any(indicator in url.lower() for indicator in article_indicators)
+        if any(section in url_lower for section in special_sections):
+            self.logger.debug(f"Skipping special section: {url}")
+            return False
 
-    def _parse_article_data(self, article_element: BeautifulSoup, url: str) -> NewsArticle:
+        # Check if URL contains article ID pattern (e.g., /art42380421)
+        import re
+        if '/art' in url_lower and re.search(r'/art\d+', url_lower):
+            self.logger.debug(f"Valid article URL found: {url}")
+            return True
+            
+        self.logger.debug(f"Invalid article URL (no article ID): {url}")
+        return False
+
+    async def _parse_article_data(self, article_element: BeautifulSoup, url: str) -> NewsArticle:
         """Parse single article data"""
         try:
             self.logger.info(f"Parsing article: {url}")
@@ -100,7 +156,15 @@ class NewsParser:
             update_date = article_element.select_one("#liveRetainAtContainerInner")
 
             # Image and its description
-            image = article_element.select_one("picture img") or article_element.select_one("div.blog--image img")
+            image = None
+            # Try to find image in blog--image div first
+            blog_image_div = article_element.select_one("div.blog--image")
+            if blog_image_div:
+                image = blog_image_div.select_one("img")
+            # If not found, try other selectors
+            if not image:
+                image = article_element.select_one("picture img")
+            
             image_desc = article_element.select_one("p.article--media--lead")
             image_author = article_element.select_one("p.image--author")
 
@@ -117,7 +181,36 @@ class NewsParser:
                         'url': urljoin(self.base_url, crumb.get('href', ''))
                     })
 
-            # Introductory text
+            # Full article text
+            full_text_parts = []
+            
+            # Try the specific article content selector first
+            content = article_element.select_one("div.article--content.mx-auto.my-0")
+            if not content:
+                # If not found, try alternative selectors
+                content_selectors = [
+                    "div.article-body",
+                    "div.article--content",
+                    "div.article--text",
+                    "article.article-content",
+                    "div.blog--content"
+                ]
+                for selector in content_selectors:
+                    content = article_element.select_one(selector)
+                    if content:
+                        break
+
+            if content:
+                # Get all paragraphs from content
+                paragraphs = content.select("p")
+                for p in paragraphs:
+                    # Skip if it's an image description
+                    if not p.find_parent("figcaption") and not "image--author" in p.get("class", []):
+                        text = p.text.strip()
+                        if text:
+                            full_text_parts.append(text)
+
+            # Get intro text (might be in a different section)
             intro_text = []
             intro_block = article_element.select_one("div.intro--body--text--fadeOut")
             if intro_block:
@@ -135,82 +228,197 @@ class NewsParser:
                 image_author=image_author.text.strip() if image_author else None,
                 author=author.text.strip() if author else None,
                 breadcrumbs=breadcrumbs,
-                intro_text="\n".join(intro_text) if intro_text else None
+                intro_text="\n".join(intro_text) if intro_text else None,
+                full_text="\n\n".join(full_text_parts) if full_text_parts else None
             )
         except Exception as e:
             self.logger.error(f"Error parsing article {url}: {str(e)}")
             return None
 
-    def parse_by_category(self, cat_lv1: str = None, cat_lv2: str = None, cat_lv3: str = None, 
-                         limit: int = 5) -> dict:
-        """Parse news by specified categories"""
-        # Forming URL for the category
-        category_path = '/'.join(filter(None, [cat_lv1, cat_lv2, cat_lv3]))
-        category_url = urljoin(self.base_url, category_path)
-        
-        self.logger.info(f"Requesting category page: {category_url}")
-        html = self._get_page_content(category_url)
-        if not html:
-            return {"error": "Failed to retrieve category page"}
-        
-        self.logger.info("Category page successfully retrieved")
-        soup = BeautifulSoup(html, 'html.parser')
-
-        # Looking for articles using various selectors
-        article_links = []
-        article_selectors = [
-            "div[data-mrf-section='Category / ListOfArticles'] a[href]",  # Main article container
-            "div[data-gtm-placement^='type:content'] a[href]",  # Containers with GTM markup
-            "div[data-mrf-recirculation*='Category / ListOfArticles'] a[href]",  # Additional articles
-            "div.content--block a[href]"  # Content blocks
-        ]
-
-        # Filtering links by selectors
-        for selector in article_selectors:
-            links = soup.select(selector)
-            if links:
-                filtered_links = [link for link in links if self._is_valid_article_url(link.get('href', ''))]
-                self.logger.info(f"Found {len(filtered_links)} valid links for selector {selector}")
-                article_links.extend(filtered_links)
-
-        # Processing found links
-        article_urls = []
-        seen_urls = set()
-        
-        self.logger.info(f"Total links found: {len(article_links)}")
-        
-        # Filtering and checking links
-        for link in article_links:
-            if len(article_urls) >= limit:
-                break
+    async def parse_by_category(self, cat_lv1: str = None, cat_lv2: str = None, cat_lv3: str = None, 
+                              limit: int = 5, save_to_file: bool = True) -> dict:
+        """Parse news by specified categories asynchronously"""
+        try:
+            # Forming URL for the category
+            category_path = '/'.join(filter(None, [cat_lv1, cat_lv2, cat_lv3]))
+            category_url = urljoin(self.base_url, category_path)
             
-            url = urljoin(self.base_url, link.get('href', ''))
+            self.logger.info(f"Requesting category page: {category_url}")
+            html = await self._get_page_content(category_url)
             
-            if url not in seen_urls and self._is_valid_article_url(url):
-                self.logger.info(f"Adding article: {url}")
-                article_urls.append(url)
-                seen_urls.add(url)
+            if not html:
+                self.logger.error(f"Failed to retrieve category page: {category_url}")
+                return {
+                    "error": "Failed to retrieve category page",
+                    "category_url": category_url,
+                    "category_path": category_path
+                }
+            self.logger.info("Category page successfully retrieved")
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # First find all content blocks that contain articles
+            article_blocks = []
+            block_selectors = [
+                "div[data-gtm-placement^='type:content/position:']",  # Main blocks with position
+                "div.content--block",  # All content blocks
+                "div[data-mrf-recirculation^='Category / ListOfArticles']"  # Additional blocks
+            ]
+            
+            self.logger.info("Looking for article blocks...")
+            for selector in block_selectors:
+                blocks = soup.select(selector)
+                self.logger.info(f"Found {len(blocks)} blocks with selector: {selector}")
+                for block in blocks:
+                    self.logger.debug(f"Block HTML: {block}")
+                article_blocks.extend(blocks)            # Then find links within these blocks
+            article_links = []
+            link_selectors = [
+                "a.contentLink[href][data-gtm-trigger='title']",  # Main content links
+                "a[href][cmp-ltrk^='Category / ListOfArticles']",  # Category list articles
+                "a[href][data-mrf-link]"  # Links with mrf tracking
+            ]
+            self.logger.info("Looking for article links within blocks...")
+            for block in article_blocks:
+                # Log the block class and data attributes for debugging
+                self.logger.info(f"Processing block: class='{block.get('class', [])}' data-gtm-placement='{block.get('data-gtm-placement', '')}'")
+                
+                for selector in link_selectors:
+                    links = block.select(selector)
+                    if links:
+                        self.logger.info(f"Found {len(links)} raw links with selector '{selector}'")
+                        for link in links:
+                            url = link.get('href', '')
+                            is_valid = self._is_valid_article_url(url)
+                            self.logger.info(f"URL: {url} - Valid: {is_valid}")
+                            
+                        filtered_links = [link for link in links if self._is_valid_article_url(link.get('href', ''))]
+                        if filtered_links:
+                            self.logger.info(f"Found {len(filtered_links)} valid links in block using selector: {selector}")
+                            for link in filtered_links:
+                                self.logger.info(f"Adding valid link: {link.get('href', '')}")
+                        article_links.extend(filtered_links)
 
-        # Collecting article data
-        articles = []
-        for url in article_urls:
-            html = self._get_page_content(url)
-            if html:
-                soup = BeautifulSoup(html, 'html.parser')
-                article_data = self._parse_article_data(soup, url)
-                if article_data:
-                    articles.append(article_data.to_dict())
-                    self.logger.info(f"Successfully processed article: {url}")
+            # Check if we found any articles
+            if not article_links:
+                self.logger.warning(f"No articles found in category: {category_path}")
+                return {
+                    "category_url": category_url,
+                    "articles_found": 0,
+                    "category_path": category_path,
+                    "parsed_at": datetime.now().isoformat(),
+                    "articles": []
+                }
 
-        return {
-            "category_url": category_url,
-            "articles_found": len(articles),
-            "articles": articles
-        }
+            # Processing found links
+            article_urls = []
+            seen_urls = set()
+            
+            self.logger.info(f"Total links found: {len(article_links)}")
+            
+            # Filtering and checking links
+            for link in article_links:
+                if len(article_urls) >= limit:
+                    break
+                
+                url = urljoin(self.base_url, link.get('href', ''))
+                
+                if url not in seen_urls and self._is_valid_article_url(url):
+                    self.logger.info(f"Adding article: {url}")
+                    article_urls.append(url)
+                    seen_urls.add(url)
+
+            # Process articles concurrently with rate limiting
+            tasks = []
+            semaphore = asyncio.Semaphore(3)  # Limit concurrent requests to 3
+
+            async def fetch_with_semaphore(url):
+                try:
+                    async with semaphore:
+                        return await self._parse_article_data(
+                            BeautifulSoup(await self._get_page_content(url), 'html.parser'),
+                            url
+                        )
+                except Exception as e:
+                    self.logger.error(f"Error fetching article {url}: {e}")
+                    return None
+
+            for url in article_urls:
+                tasks.append(fetch_with_semaphore(url))
+
+            articles = []
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            articles = []
+            for result in results:
+                if isinstance(result, Exception):
+                    self.logger.error(f"Error processing article: {result}")
+                    continue
+                if result:
+                    articles.append(result.to_dict())
+
+            result = {
+                "category_url": category_url,
+                "articles_found": len(articles),
+                "category_path": category_path,
+                "parsed_at": datetime.now().isoformat(),
+                "articles": articles
+            }
+
+            if save_to_file and articles:
+                self.save_to_json(result, category_path)
+
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error parsing category {category_path}: {e}")
+            return {
+                "error": str(e),
+                "category_url": category_url if 'category_url' in locals() else None,
+                "category_path": category_path if 'category_path' in locals() else None
+            }
+
+    def save_to_json(self, data: dict, category_path: str) -> str:
+        """Save parsed articles to a JSON file
+        
+        Args:
+            data: Dictionary containing articles and metadata
+            category_path: Category path used for the filename
+            
+        Returns:
+            str: Path to the saved JSON file
+        """
+        # Create data/articles directory if it doesn't exist
+        os.makedirs("data/articles", exist_ok=True)
+        
+        # Create a filename based on category and timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_category = category_path.replace("/", "_").strip("_")
+        filename = f"data/articles/{safe_category}_{timestamp}.json"
+        
+        # Save the data
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            
+        self.logger.info(f"Articles saved to {filename}")
+        return filename
 
     def add_category(self, parent_code: str = None, code: str = None, name: str = None) -> bool:
         """Add new category"""
         return self.category_structure.add_category(parent_code, code, name)
+
+    def save_articles_to_json(self, articles: list, file_path: str) -> bool:
+        """Save parsed articles to a JSON file"""
+        try:
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            
+            with open(file_path, 'w', encoding='utf-8') as json_file:
+                json.dump(articles, json_file, ensure_ascii=False, indent=4)
+            
+            self.logger.info(f"Articles successfully saved to {file_path}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Error saving articles to JSON: {str(e)}")
+            return False
 
 
 # Example usage:
@@ -218,24 +426,47 @@ if __name__ == "__main__":
     parser = NewsParser()
     
     # Example parsing by categories with specified number of news
-    result = parser.parse_by_category(
-        cat_lv1="ekonomia",
-        cat_lv2="biznes",
-        cat_lv3="eksport",
-        limit=3  # Get 7 latest news
-    )
-    
-    # Output results
-    if "error" in result:
-        print(f"Error: {result['error']}")
-    else:
-        print(f"\nArticles found: {result['articles_found']}")
-        print(f"Category URL: {result['category_url']}\n")
+    async def main():
+        result = await parser.parse_by_category(
+            cat_lv1="ekonomia",
+            cat_lv2="biznes",
+            cat_lv3="eksport",
+            limit=3,
+            save_to_file=True  # Enable saving to JSON
+        )
         
-        for article in result['articles']:
-            print(f"Title: {article['title']}")
-            print(f"Subtitle: {article['subtitle']}")
-            print(f"Publication date: {article['publication_date']}")
-            print(f"Author: {article['author']}")
-            print(f"URL: {article['url']}")
-            print("-" * 80)
+        # Output results
+        if "error" in result:
+            print(f"Error: {result['error']}")
+        else:
+            print(f"\nArticles found: {result['articles_found']}")
+            print(f"Category URL: {result['category_url']}")
+            print(f"Results saved in data/articles directory\n")
+            
+            for article in result['articles']:
+                print("=" * 100)
+                print(f"Title: {article['title']}")
+                print(f"Subtitle: {article['subtitle']}")
+                print(f"Publication date: {article['publication_date']}")
+                print(f"Author: {article['author']}")
+                print(f"URL: {article['url']}")
+                print(f"Image URL: {article['image_url']}")
+                print("-" * 50)
+                
+                if article['full_text']:
+                    print("\nFull article text:")
+                    print("-" * 30)
+                    print(article['full_text'])
+                elif article['intro_text']:
+                    print("\nArticle introduction:")
+                    print("-" * 30)
+                    print(article['intro_text'])
+                    print("\nNote: Full article text is not available (possible paywall)")
+                else:
+                    print("\nNo article text available")
+                
+                print("=" * 100)
+                print("\n")
+
+    # Run the async main function
+    asyncio.run(main())

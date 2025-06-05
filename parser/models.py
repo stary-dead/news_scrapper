@@ -15,6 +15,7 @@ class NewsArticle:
     author: str = None
     breadcrumbs: list = None
     intro_text: str = None  # Article introduction text (before paywall)
+    full_text: str = None   # Full article text
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON"""
@@ -29,5 +30,6 @@ class NewsArticle:
             'image_author': self.image_author,
             'author': self.author,
             'breadcrumbs': self.breadcrumbs,
-            'intro_text': self.intro_text
+            'intro_text': self.intro_text,
+            'full_text': self.full_text
         }

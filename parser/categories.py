@@ -140,3 +140,48 @@ class CategoryStructure:
         """
         category = self.get_category(*parent_codes)
         return category if category else {}
+
+    def is_valid_category(self, category: str) -> bool:
+        """
+        Check if category exists in the first level of hierarchy
+        
+        Args:
+            category (str): Category code to check
+            
+        Returns:
+            bool: True if category exists, False otherwise
+        """
+        return category in self.categories
+
+    def get_all_subcategory_paths(self, parent_code: str = None) -> list:
+        """
+        Get all possible subcategory paths from a parent category
+        
+        Args:
+            parent_code (str): Parent category code
+            
+        Returns:
+            list: List of tuples containing category path codes from parent to leaf
+        """
+        def collect_paths(category_dict, current_path):
+            paths = []
+            if not category_dict.get('subcategories'):
+                return [current_path] if current_path else []
+                
+            if current_path:  # Add the current path if it's not empty
+                paths.append(current_path)
+                
+            for code, subcat in category_dict['subcategories'].items():
+                new_path = current_path + (code,)
+                sub_paths = collect_paths(subcat, new_path)
+                paths.extend(sub_paths)
+            return paths
+            
+        if parent_code is None:
+            return []
+            
+        category = self.categories.get(parent_code)
+        if not category:
+            return []
+            
+        return collect_paths(category, (parent_code,))

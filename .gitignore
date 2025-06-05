@@ -39,4 +39,5 @@ ENV/
 *.log
 .DS_Store
 data/*.json
+data/
 !parser/data/categories.json  # Keep the categories.json file in version control
