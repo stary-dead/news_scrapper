@@ -1,0 +1,88 @@
+version: '3.8'
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: news_scrapper_rabbitmq
+    ports:
+      - "5672:5672"   # AMQP протокол
+      - "15672:15672" # Веб-интерфейс управления
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_DEFAULT_USER}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    restart: unless-stopped
+    networks:
+      - app_network
+
+  postgres:
+    image: postgres:15
+    container_name: news_scrapper_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - app_network
+
+  parser:
+    build:
+      context: .
+      dockerfile: parser/Dockerfile
+    container_name: news_scrapper_parser
+    depends_on:
+      - rabbitmq
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+    restart: unless-stopped
+    networks:
+      - app_network
+  db_service:
+    build:
+      context: .
+      dockerfile: db_service/Dockerfile
+    container_name: news_scrapper_db_service
+    depends_on:
+      - postgres
+      - rabbitmq
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - DB_HOST=postgres
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_NAME=${POSTGRES_DB}
+    restart: unless-stopped
+    networks:
+      - app_network
+
+  telegram_bot:
+    build:
+      context: .
+      dockerfile: telegram_bot/Dockerfile
+    container_name: news_scrapper_telegram_bot
+    depends_on:
+      - rabbitmq
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - BOT_TOKEN=${BOT_TOKEN}
+      - TELEGRAM_CHANNEL_ID=${TELEGRAM_CHANNEL_ID}
+    restart: unless-stopped
+    networks:
+      - app_network
+
+networks:
+  app_network:
+    name: news_scrapper_network
+    driver: bridge
+
+volumes:
+  rabbitmq_data:
+    name: news_scrapper_rabbitmq_data
+  postgres_data:
+    name: news_scrapper_postgres_data

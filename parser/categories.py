@@ -185,3 +185,36 @@ class CategoryStructure:
             return []
             
         return collect_paths(category, (parent_code,))
+
+    def find_category_lv3_path(self, cat_lv3: str) -> tuple:
+        """
+        Find the full path (lv1, lv2, lv3) for a given level 3 category
+        
+        Args:
+            cat_lv3 (str): Level 3 category code to find
+            
+        Returns:
+            tuple: (cat_lv1, cat_lv2, cat_lv3) if found, None if not found
+        """
+        def search_in_subcategories(categories, target, path=()):
+            for code, cat in categories.items():
+                current_path = path + (code,)
+                
+                # If we're at level 3 and found our target
+                if len(current_path) == 3 and code == target:
+                    return current_path
+                    
+                # If we haven't reached level 3 yet, search deeper
+                if len(current_path) < 3 and 'subcategories' in cat:
+                    result = search_in_subcategories(cat['subcategories'], target, current_path)
+                    if result:
+                        return result
+            return None
+            
+        # Search in all top-level categories
+        for cat_lv1, cat_data in self.categories.items():
+            if 'subcategories' in cat_data:
+                result = search_in_subcategories(cat_data['subcategories'], cat_lv3, (cat_lv1,))
+                if result:
+                    return result
+        return None

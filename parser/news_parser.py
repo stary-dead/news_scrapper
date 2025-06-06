@@ -1,4 +1,4 @@
-from .categories import CategoryStructure
+from parser.categories import CategoryStructure
 import httpx
 import asyncio
 from bs4 import BeautifulSoup
@@ -375,6 +375,87 @@ class NewsParser:
                 "category_url": category_url if 'category_url' in locals() else None,
                 "category_path": category_path if 'category_path' in locals() else None
             }
+
+    async def stream_articles_by_category(self, cat_lv1: str = None, cat_lv2: str = None, cat_lv3: str = None):
+        """Parse and yield news articles one by one as they are parsed
+        
+        Args:
+            cat_lv1 (str, optional): Level 1 category
+            cat_lv2 (str, optional): Level 2 category
+            cat_lv3 (str, optional): Level 3 category
+            
+        Yields:
+            dict: Article data as it becomes available
+        """
+        try:
+            # Forming URL for the category
+            category_path = '/'.join(filter(None, [cat_lv1, cat_lv2, cat_lv3]))
+            category_url = urljoin(self.base_url, category_path)
+            
+            self.logger.info(f"Requesting category page: {category_url}")
+            html = await self._get_page_content(category_url)
+            
+            if not html:
+                self.logger.error(f"Failed to retrieve category page: {category_url}")
+                return
+
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Find all article links
+            article_links = []
+            article_blocks = []
+            
+            # Find content blocks
+            block_selectors = [
+                "div[data-gtm-placement^='type:content/position:']",
+                "div.content--block",
+                "div[data-mrf-recirculation^='Category / ListOfArticles']"
+            ]
+            
+            for selector in block_selectors:
+                blocks = soup.select(selector)
+                article_blocks.extend(blocks)
+
+            # Find links within blocks
+            link_selectors = [
+                "a.contentLink[href][data-gtm-trigger='title']",
+                "a[href][cmp-ltrk^='Category / ListOfArticles']",
+                "a[href][data-mrf-link]"
+            ]
+            
+            for block in article_blocks:
+                for selector in link_selectors:
+                    links = block.select(selector)
+                    article_links.extend([
+                        link for link in links 
+                        if self._is_valid_article_url(link.get('href', ''))
+                    ])
+
+            # Process articles one by one with rate limiting
+            semaphore = asyncio.Semaphore(1)  # Process one article at a time
+            
+            for link in article_links:
+                url = urljoin(self.base_url, link.get('href', ''))
+                
+                try:
+                    async with semaphore:
+                        article_html = await self._get_page_content(url)
+                        if not article_html:
+                            continue
+                            
+                        article_soup = BeautifulSoup(article_html, 'html.parser')
+                        article = await self._parse_article_data(article_soup, url)
+                        
+                        if article:
+                            yield article.to_dict()
+                            
+                except Exception as e:
+                    self.logger.error(f"Error processing article {url}: {e}")
+                    continue
+
+        except Exception as e:
+            self.logger.error(f"Error in stream_articles_by_category: {e}")
+            return
 
     def save_to_json(self, data: dict, category_path: str) -> str:
         """Save parsed articles to a JSON file

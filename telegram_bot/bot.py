@@ -1,16 +1,18 @@
-"""Main bot module"""
+"""Main bot module for channel news posting"""
 import asyncio
 import logging
-from aiogram import Bot, Dispatcher, Router, types
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message
-from config import BotConfig
+from aiogram import Bot, Dispatcher, Router
+from telegram_bot.config import BotConfig
 import sys
 import os
+from datetime import datetime
+from telegram_bot.rabbitmq_utils import RabbitMQClient
 
-# Add parent directory to path to import parser
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from parser.news_parser import NewsParser
+# Add the project root to Python path
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from parser.categories import CategoryStructure
 
 # Initialize bot and dispatcher
@@ -19,134 +21,132 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# Initialize parser
-news_parser = NewsParser()
-category_structure = CategoryStructure()
+# Initialize RabbitMQ client
+rabbitmq_client = RabbitMQClient()
 
-@router.message(CommandStart())
-async def start_command(message: Message):
-    """Handle /start command"""
-    await message.answer(
-        "Привет! Я бот для чтения новостей с rp.pl\n"
-        "Отправь мне название категории (например, 'ekonomia'), "
-        "и я пришлю тебе последние новости из этой категории."
-    )
+# Constants
+PARSED_ARTICLES_QUEUE = "parsed_articles"      # Очередь для обработанных статей
+TELEGRAM_CHANNEL_ID = -1002745773579          # ID канала для отправки новостей
+MESSAGE_DELAY = 5                             # Задержка между отправкой сообщений (секунды)
+MAX_RETRIES = 3                              # Максимальное количество попыток отправки сообщения
 
-@router.message()
-async def process_category(message: Message):
-    """Process category name and return news"""
-    category = message.text.lower()
+# Семафор для ограничения параллельной обработки сообщений
+message_semaphore = asyncio.Semaphore(2)  # Максимум 2 сообщения одновременно
+
+async def send_telegram_message(chat_id: int, message_text: str, photo_url: str = None) -> bool:
+    """
+    Отправка сообщения в Telegram с повторными попытками
     
-    # Check if category exists in level 1
-    if not category_structure.is_valid_category(category):
-        await message.answer(
-            f"Категория '{category}' не найдена.\n"
-            f"Доступные категории:\n"
-            f"- ekonomia (Экономика)\n"
-            f"- biznes (Бизнес)\n"
-            f"- kraj (Страна)\n"
-            f"- swiat (Мир)\n"
-            f"и другие."
-        )
-        return
-
-    # Send initial message
-    status_message = await message.answer(f"Ищу новости в категории '{category}' и её подкатегориях...")
-
-    try:
-        # Get all subcategory paths for the selected category
-        subcategory_paths = category_structure.get_all_subcategory_paths(category)
+    Args:
+        chat_id (int): ID чата/канала
+        message_text (str): Текст сообщения
+        photo_url (str, optional): URL изображения
         
-        if not subcategory_paths:
-            await status_message.edit_text(
-                f"Не найдено подкатегорий для категории '{category}'.\n"
-                f"Пожалуйста, выберите другую категорию."
-            )
-            return
-
-        articles_found = False
-        processed_urls = set()  # To avoid duplicate articles
-
-        # Process each subcategory path
-        for path in subcategory_paths:
-            try:
-                cat_args = {}
-                if len(path) >= 1:
-                    cat_args['cat_lv1'] = path[0]
-                if len(path) >= 2:
-                    cat_args['cat_lv2'] = path[1]
-                if len(path) >= 3:
-                    cat_args['cat_lv3'] = path[2]
-
-                # Get one latest article from this subcategory
-                result = await asyncio.wait_for(
-                    news_parser.parse_by_category(**cat_args, limit=1),
-                    timeout=10  # 10 seconds timeout per subcategory
+    Returns:
+        bool: True если сообщение отправлено успешно
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            if photo_url:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo_url,
+                    caption=message_text,
+                    parse_mode="Markdown"
                 )
-
-                if result and result.get("articles"):
-                    for article in result["articles"]:
-                        if article.get('title') and article.get('url'):
-                            # Skip if we already sent this article
-                            if article['url'] in processed_urls:
-                                continue
-                                
-                            processed_urls.add(article['url'])
-                            articles_found = True
-                            
-                            # Get the full category path name
-                            subcategory_name = " > ".join([
-                                category_structure.get_category_name(*path[:i+1]) or path[i]
-                                for i in range(len(path))
-                            ])
-                            
-                            message_text = (
-                                f"📰 *{article['title']}*\n\n"
-                                f"📁 {subcategory_name}\n"
-                                f"🔍 {article.get('subtitle', '')}\n\n"
-                                f"📅 {article.get('publication_date', 'Дата не указана')}\n"
-                                f"✍️ {article.get('author', 'Автор не указан')}\n\n"
-                                f"🔗 [Читать полностью]({article['url']})"
-                            )
-                            
-                            await message.answer(
-                                message_text,
-                                parse_mode="Markdown",
-                                disable_web_page_preview=True
-                            )
-                            await asyncio.sleep(0.5)  # Small delay between messages
-
-            except asyncio.TimeoutError:
-                logging.warning(f"Timeout while processing subcategory {' > '.join(path)}")
-                continue
-            except Exception as e:
-                logging.error(f"Error processing subcategory {' > '.join(path)}: {e}")
-                continue
-
-        if not articles_found:
-            await status_message.edit_text(
-                f"В категории '{category}' и её подкатегориях не найдено актуальных статей.\n"
-                f"Попробуйте:\n"
-                f"1. Проверить другие категории\n"
-                f"2. Подождать некоторое время\n"
-                f"3. Уточнить запрос"
-            )
-            return
+            else:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=message_text,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True
+                )
+            return True
             
-        await status_message.delete()
+        except Exception as e:
+            logging.error(f"Attempt {attempt + 1} failed: {e}")
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+            continue
+            
+    return False
 
+async def process_article_message(message: dict) -> None:
+    """
+    Обработчик сообщений из очереди RabbitMQ с контролем скорости
+    
+    Args:
+        message (dict): Сообщение с данными статьи
+    """
+    async with message_semaphore:  # Контролируем количество параллельных отправок
+        try:
+            article = message.get("article")
+            category_name = message.get("category_name")
+            
+            if not article:
+                logging.error("Отсутствуют данные статьи в сообщении")
+                return
+
+            # Подготовка текста сообщения
+            message_text = (
+                f"📰 *{article['title']}*\n\n"
+                f"📁 {category_name}\n"
+                f"🔍 {article.get('subtitle', '')}\n\n"
+                f"📅 {article.get('publication_date', 'Data nie podana')}\n"
+                f"✍️ {article.get('author', 'Autor nie podany')}\n\n"
+                f"🔗 [Czytaj więcej]({article['url']})"
+            )
+
+            # Отправка сообщения с повторными попытками
+            success = await send_telegram_message(
+                chat_id=TELEGRAM_CHANNEL_ID,
+                message_text=message_text,
+                photo_url=article.get('image_url')
+            )
+
+            if success:
+                # Добавляем задержку между сообщениями для равномерного потока
+                await asyncio.sleep(MESSAGE_DELAY)
+            else:
+                logging.error("Failed to send message after all retries")
+                
+        except Exception as e:
+            logging.error(f"Ошибка обработки статьи: {e}")
+
+async def start_rabbitmq():
+    """
+    Инициализация и настройка подключения к RabbitMQ
+    """
+    try:
+        await rabbitmq_client.connect()
+        await rabbitmq_client.declare_queue(PARSED_ARTICLES_QUEUE)
+        await rabbitmq_client.consume_messages(PARSED_ARTICLES_QUEUE, process_article_message)
+        logging.info("RabbitMQ успешно инициализирован")
     except Exception as e:
-        logging.error(f"Error processing category {category}: {e}")
-        await status_message.edit_text(
-            f"❌ Произошла ошибка при поиске новостей.\n"
-            f"Мы уже работаем над её устранением.\n"
-            f"Пожалуйста, попробуйте позже или выберите другую категорию."
-        )
+        logging.error(f"Ошибка инициализации RabbitMQ: {e}")
+        raise
 
 async def main():
     """Main function"""
     # Configure logging
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
+    # Инициализируем RabbitMQ
+    await start_rabbitmq()
+    
+    try:
+        # Отправляем приветственное сообщение в канал при запуске
+        await bot.send_message(
+            chat_id=TELEGRAM_CHANNEL_ID,
+            text="🤖 Bot został uruchomiony i rozpoczyna monitoring wiadomości.\n"
+                 "Nowe artykuły będą automatycznie publikowane w tym kanale.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка отправки приветственного сообщения: {e}")
     
     # Start polling
     await dp.start_polling(bot)
