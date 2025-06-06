@@ -1,89 +1,143 @@
-# 📰 RP News Aggregator
+# Polish News Scraper 🗞️
 
-## 📌 Project Overview
-
-**RP News Aggregator** is a microservices-based system for scraping, analyzing, and delivering news from the Polish news website [rp.pl](https://www.rp.pl). It is designed to demonstrate modern backend architecture using Django, Celery, RabbitMQ, and Kubernetes.
+A microservices-based system for scraping, processing, and delivering news articles from rp.pl to Telegram channels.
 
 ## 🚀 Features
 
-- Scrape news articles from [rp.pl]
-- Store data in PostgreSQL
-- RESTful API to access and search news
-- Telegram bot for daily headlines and keyword search
-- Scalable deployment with Docker & Kubernetes
-- Basic NLP: keyword extraction, category tagging
+- Asynchronous web scraping with rate limiting and error handling
+- Article parsing with support for:
+  - Titles, subtitles, and content 
+  - Publication dates
+  - Authors and image credits
+  - Article categories and breadcrumbs
+- Message queue integration with RabbitMQ
+- PostgreSQL storage for articles
+- Telegram bot for news delivery
+- Containerized deployment with Docker Compose
+- Comprehensive test coverage
 
-## 🛠️ Tech Stack
+## 🏗️ Architecture
 
-- Python 3.10
-- Django + Django REST Framework
-- Celery + RabbitMQ
-- PostgreSQL
-- Aiogram (Telegram Bot)
-- Docker + Docker Compose
-- Kubernetes (with Helm optionally)
-- BeautifulSoup + Aiohttp
+The system consists of three main microservices:
 
----
+1. **Parser Service** (`parser/`)
+   - Scrapes articles from rp.pl
+   - Extracts article content and metadata
+   - Publishes to RabbitMQ queue
 
-## 📂 Project Structure
+2. **Database Service** (`db_service/`)
+   - Stores articles in PostgreSQL
+   - Handles article deduplication
+   - Manages article processing status
 
-rp-news-aggregator/
-├── parser/ # Async news scraper (Celery worker)
-├── django_app/ # Django project with REST API
-├── telegram_bot/ # Aiogram-based Telegram bot
-├── scripts/ # Helper and init scripts
-├── k8s/ # Kubernetes manifests
-├── docker-compose.yml # Local container orchestration
-├── requirements.txt # Python dependencies
-└── README.md # This file
+3. **Telegram Bot** (`telegram_bot/`)
+   - Formats articles for Telegram
+   - Delivers news to channels
+   - Handles message retries
 
+## 📋 Prerequisites
 
----
+- Python 3.10+
+- Docker and Docker Compose
+- PostgreSQL 15
+- RabbitMQ 3.x
 
-## 📈 Development Roadmap
+## 🛠️ Installation
 
-### ✅ Phase 1: Research & Parsing Prototype
-- Analyze the rp.pl website structure
-- Build a simple asynchronous parser using `aiohttp` + `BeautifulSoup`
-- Output titles, URLs, timestamps, descriptions
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/polish-news-scraper.git
+cd polish-news-scraper
+```
 
-### 🛠️ Phase 2: Celery-Based Parsing Microservice
-- Integrate the parser as a Celery task
-- Use RabbitMQ as the broker
-- Periodically fetch news and store in PostgreSQL
+2. Create and configure `.env` file:
+```bash
+cp .env.example .env
+# Edit .env with your settings
+```
 
-### 🌐 Phase 3: API and Admin Panel
-- Create Django models for news articles
-- Provide API endpoints (list, detail, search by keyword/date/category)
-- Add Django admin interface
+3. Build and start services:
+```bash
+docker-compose up -d
+```
 
-### 🤖 Phase 4: Telegram Bot
-- Build a Telegram bot using Aiogram
-- Allow users to:
-  - View latest news
-  - Search by keywords
-  - Subscribe to daily digests
+## 🧪 Running Tests
 
-### 🐳 Phase 5: Containerization and Kubernetes
-- Dockerize all services
-- Provide `docker-compose.yml` for local dev
-- Kubernetes manifests for production (or Helm charts)
-- Ingress + optional TLS termination
-
-### (Optional) 📊 Phase 6: NLP & Web Interface
-- Keyword extraction (e.g., `yake`, `spaCy`)
-- Sentiment analysis
-- Minimal frontend with search and filter
-
----
-
-## 🧪 Getting Started (Local)
+Use the provided PowerShell script to run tests:
 
 ```bash
-git clone https://github.com/stary-dead/rp-news-aggregator.git
-cd rp-news-aggregator
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-docker-compose up --build
+./run_tests.ps1
+```
+
+This will:
+- Start required Docker containers
+- Set up test database
+- Run pytest with all test suites
+
+## 📝 Environment Variables
+
+Required environment variables in `.env`:
+
+```ini
+# Bot configuration
+BOT_TOKEN=your_telegram_bot_token
+TELEGRAM_CHANNEL_ID=your_channel_id
+
+# Database
+POSTGRES_DB=news_db
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=your_password
+
+# RabbitMQ
+RABBITMQ_DEFAULT_USER=guest
+RABBITMQ_DEFAULT_PASS=guest
+```
+
+## 🔄 Service Workflow
+
+1. Parser service periodically checks rp.pl categories
+2. New articles are published to RabbitMQ
+3. Database service stores unique articles
+4. Telegram bot formats and delivers articles to channel
+5. Articles are marked as processed after delivery
+
+## 🛡️ Error Handling
+
+- Retry mechanisms for network requests
+- Message queue persistence
+- Duplicate article detection
+- Rate limiting for API requests
+- Comprehensive error logging
+
+## 🧪 Test Coverage
+
+Includes tests for:
+- Article parsing and extraction
+- Database operations
+- Message queue handling
+- Telegram message formatting
+- Error scenarios
+
+## 📦 Project Structure
+
+```
+.
+├── parser/              # News scraping service
+├── db_service/          # Database operations
+├── telegram_bot/        # Telegram delivery
+├── tests/              # Test suites
+├── docker-compose.yml  # Service orchestration
+└── requirements.txt    # Python dependencies
+```
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Commit your changes
+4. Push to your branch
+5. Open a Pull Request
+
+## 📄 License
+
+This project is licensed under the MIT License - see the LICENSE file for details.

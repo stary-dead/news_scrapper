@@ -128,7 +128,8 @@ class NewsParser:
                 "h1.blog--title",
                 "h1.article--title",
                 "div.article--title",
-                "header h1"
+                "header h1",
+                "h1.contentTitle"  # Added additional selector
             ]
             for selector in title_selectors:
                 title = article_element.select_one(selector)
@@ -143,7 +144,9 @@ class NewsParser:
                 "div.blog--subtitle",
                 "div.article--subtitle",
                 ".article--lead",
-                ".article-description"
+                ".article-description",
+                "div.article--element--text--subtitle",  # Added additional selector
+                "div.lead"  # Added additional selector
             ]
             for selector in subtitle_selectors:
                 subtitle = article_element.select_one(selector)
@@ -153,6 +156,18 @@ class NewsParser:
 
             # Publication and update dates
             pub_date = article_element.select_one("#livePublishedAtContainer")
+            if not pub_date:
+                # Try alternative date selectors
+                date_selectors = [
+                    "time.article--time",
+                    "span.article--published",
+                    "div.article--published"
+                ]
+                for selector in date_selectors:
+                    pub_date = article_element.select_one(selector)
+                    if pub_date:
+                        break
+
             update_date = article_element.select_one("#liveRetainAtContainerInner")
 
             # Image and its description
@@ -163,13 +178,39 @@ class NewsParser:
                 image = blog_image_div.select_one("img")
             # If not found, try other selectors
             if not image:
-                image = article_element.select_one("picture img")
+                image_selectors = [
+                    "picture img",
+                    "div.article--image img",
+                    "div.article--media img",
+                    ".article--top--image img",
+                    "figure.main-photo img"
+                ]
+                for selector in image_selectors:
+                    image = article_element.select_one(selector)
+                    if image:
+                        break
             
             image_desc = article_element.select_one("p.article--media--lead")
+            if not image_desc:
+                image_desc = article_element.select_one("figcaption.image-description")
+
             image_author = article_element.select_one("p.image--author")
+            if not image_author:
+                image_author = article_element.select_one("div.image-author")
 
             # Author of the article
-            author = article_element.select_one("div.author p.name a")
+            author = None
+            author_selectors = [
+                "div.author p.name a",
+                "div.article--author p.name",
+                "div.article--author a",
+                "div.author-name",
+                "p.article--author"
+            ]
+            for selector in author_selectors:
+                author = article_element.select_one(selector)
+                if author:
+                    break
 
             # Breadcrumbs
             breadcrumbs = []
@@ -183,39 +224,142 @@ class NewsParser:
 
             # Full article text
             full_text_parts = []
+            intro_text_parts = []
             
-            # Try the specific article content selector first
-            content = article_element.select_one("div.article--content.mx-auto.my-0")
-            if not content:
-                # If not found, try alternative selectors
-                content_selectors = [
-                    "div.article-body",
-                    "div.article--content",
-                    "div.article--text",
-                    "article.article-content",
-                    "div.blog--content"
-                ]
-                for selector in content_selectors:
-                    content = article_element.select_one(selector)
-                    if content:
-                        break
+            # Get intro/lead text first
+            intro_selectors = [
+                "div.intro--body--text--fadeOut p.articleBodyBlock",
+                "div.article-lead p",
+                "div.lead p",
+                "div.article__lead p",
+                "div.article-intro p"
+            ]
+            
+            for selector in intro_selectors:
+                intro_blocks = article_element.select(selector)
+                if intro_blocks:
+                    for block in intro_blocks:
+                        text = block.get_text(strip=True)
+                        if text:
+                            intro_text_parts.append(text)
+                    break
+
+            # Get article content
+            content = None
+            content_selectors = [
+                "div.article--content.mx-auto.my-0",
+                "div.article-body",
+                "div.article--content",
+                "div.article--text",
+                "article.article-content",
+                "div.blog--content",
+                "div.contentBody",
+                "div[itemprop='articleBody']",  # Schema.org markup
+                "article[itemprop='articleBody']",
+                "div.article__content",
+                "div.article-text",
+                "#article-body",
+                "main article"
+            ]
+            
+            for selector in content_selectors:
+                content = article_element.select_one(selector)
+                if content:
+                    self.logger.info(f"Found article content with selector: {selector}")
+                    break
 
             if content:
-                # Get all paragraphs from content
-                paragraphs = content.select("p")
-                for p in paragraphs:
-                    # Skip if it's an image description
-                    if not p.find_parent("figcaption") and not "image--author" in p.get("class", []):
-                        text = p.text.strip()
-                        if text:
-                            full_text_parts.append(text)
+                # First, remove unnecessary elements
+                for element in content.select("script, style, iframe, .advertisement, .social-share, .related-articles"):
+                    element.decompose()
 
-            # Get intro text (might be in a different section)
-            intro_text = []
-            intro_block = article_element.select_one("div.intro--body--text--fadeOut")
-            if intro_block:
-                for p in intro_block.select("p.articleBodyBlock"):
-                    intro_text.append(p.text.strip())
+                # Get the lead/intro paragraph if it exists and wasn't found earlier
+                if not intro_text_parts:
+                    lead_selectors = [
+                        "div.lead", 
+                        "div.article-lead",
+                        "p.lead",
+                        "div.article__lead"
+                    ]
+                    for selector in lead_selectors:
+                        lead = content.select_one(selector)
+                        if lead:
+                            lead_text = lead.get_text(strip=True)
+                            if lead_text:
+                                intro_text_parts.append(lead_text)
+                            break
+
+                # Get all text-containing elements
+                for element in content.find_all(['p', 'h2', 'h3', 'h4', 'li', 'blockquote']):
+                    # Skip if element is part of unwanted content
+                    if element.find_parent(class_=['image-caption', 'article-tags', 'social-share', 'related-articles']):
+                        continue
+                    
+                    # Get text and clean it
+                    text = element.get_text(strip=True)
+                    if text and len(text) > 1:  # Skip single characters
+                        full_text_parts.append(text)
+
+            # If no structured content found, try getting all text content
+            if not full_text_parts:
+                # Try finding article text in any div with substantial content
+                for div in article_element.find_all('div', recursive=False):
+                    text = div.get_text(strip=True)
+                    if len(text) > 200:  # Only include substantial blocks of text
+                        full_text_parts.append(text)
+
+            # Get author information with more selectors
+            author = None
+            author_selectors = [
+                "div.author p.name a",
+                "div.article--author p.name",
+                "div.article--author a",
+                "div.author-name",
+                "p.article--author",
+                "span.article__author",
+                "div[itemprop='author']",
+                ".article-author",
+                ".author-info"
+            ]
+            
+            for selector in author_selectors:
+                author = article_element.select_one(selector)
+                if author:
+                    author_text = author.get_text(strip=True)
+                    if author_text:
+                        self.logger.info(f"Found author: {author_text}")
+                        break
+
+            # More comprehensive image search
+            image = None
+            image_url = None
+            
+            # Try multiple image sources
+            image_selectors = [
+                "div.blog--image img",
+                "picture img",
+                "div.article--image img",
+                "div.article--media img",
+                ".article--top--image img",
+                "figure.main-photo img",
+                "div[itemprop='image'] img",
+                ".article__image img",
+                "meta[property='og:image']"  # OpenGraph image
+            ]
+            
+            for selector in image_selectors:
+                image = article_element.select_one(selector)
+                if image:
+                    if 'content' in image.attrs:  # For meta tags
+                        image_url = image['content']
+                    elif 'src' in image.attrs:
+                        image_url = image['src']
+                    elif 'data-src' in image.attrs:
+                        image_url = image['data-src']
+                        
+                    if image_url:
+                        self.logger.info(f"Found image: {image_url}")
+                        break
 
             return NewsArticle(
                 title=title_text,
@@ -223,12 +367,12 @@ class NewsParser:
                 url=url,
                 publication_date=self._parse_datetime(pub_date.text.strip() if pub_date else None),
                 update_date=self._parse_datetime(update_date.text.strip() if update_date else None),
-                image_url=image.get('src') if image else None,
+                image_url=image_url,
                 image_description=image_desc.text.strip() if image_desc else None,
                 image_author=image_author.text.strip() if image_author else None,
                 author=author.text.strip() if author else None,
                 breadcrumbs=breadcrumbs,
-                intro_text="\n".join(intro_text) if intro_text else None,
+                intro_text="\n".join(intro_text_parts) if intro_text_parts else None,
                 full_text="\n\n".join(full_text_parts) if full_text_parts else None
             )
         except Exception as e:
